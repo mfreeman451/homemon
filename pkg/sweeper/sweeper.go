@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"strings"
 	"sync"
 	"time"
@@ -105,42 +104,57 @@ func (m *SweepMode) MarshalJSON() ([]byte, error) {
 }
 
 func (s *NetworkSweeper) generateTargets() ([]models.Target, error) {
+	// Parse all IP specifications
+	ranges, err := scan.ParseIPSpecFromStrings(s.config.Networks)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse network specifications: %w", err)
+	}
+
+	// Generate IPs from ranges
+	ips := scan.GenerateIPs(ranges)
+
+	log.Printf("Generated %d unique IP addresses from network specifications", len(ips))
+
 	var allTargets []models.Target
 
-	for _, network := range s.config.Networks {
-		// First generate all IP addresses
-		ips, err := generateIPsFromCIDR(network)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate IPs for %s: %w", network, err)
+	// Create ICMP targets if enabled
+	if containsMode(s.config.SweepModes, models.ModeICMP) {
+		for _, ip := range ips {
+			// Skip network and broadcast addresses for IPv4
+			if ip.To4() != nil {
+				if ip[15] == 0 || ip[15] == 255 {
+					continue
+				}
+			}
+			allTargets = append(allTargets, models.Target{
+				Host: ip.String(),
+				Mode: models.ModeICMP,
+			})
 		}
+	}
 
-		// For each IP, create ICMP target if enabled
-		if containsMode(s.config.SweepModes, models.ModeICMP) {
-			for _, ip := range ips {
+	// Create TCP targets for each port if enabled
+	if containsMode(s.config.SweepModes, models.ModeTCP) {
+		for _, ip := range ips {
+			// Skip network and broadcast addresses for IPv4
+			if ip.To4() != nil {
+				if ip[15] == 0 || ip[15] == 255 {
+					continue
+				}
+			}
+			for _, port := range s.config.Ports {
 				allTargets = append(allTargets, models.Target{
 					Host: ip.String(),
-					Mode: models.ModeICMP,
+					Port: port,
+					Mode: models.ModeTCP,
 				})
-			}
-		}
-
-		// For each IP, create TCP targets for each port if enabled
-		if containsMode(s.config.SweepModes, models.ModeTCP) {
-			for _, ip := range ips {
-				for _, port := range s.config.Ports {
-					allTargets = append(allTargets, models.Target{
-						Host: ip.String(),
-						Port: port,
-						Mode: models.ModeTCP,
-					})
-				}
 			}
 		}
 	}
 
-	log.Printf("Generated %d targets (%d IPs, %d ports, modes: %v)",
+	log.Printf("Generated %d targets for scanning (%d IPs, %d ports, modes: %v)",
 		len(allTargets),
-		len(allTargets)/(len(s.config.Ports)+1),
+		len(ips),
 		len(s.config.Ports),
 		s.config.SweepModes)
 
@@ -199,27 +213,4 @@ func containsMode(modes []models.SweepMode, mode models.SweepMode) bool {
 	}
 
 	return false
-}
-
-func generateIPsFromCIDR(network string) ([]net.IP, error) {
-	ip, ipnet, err := net.ParseCIDR(network)
-	if err != nil {
-		return nil, err
-	}
-
-	var ips []net.IP
-
-	for i := ip.Mask(ipnet.Mask); ipnet.Contains(i); scan.Inc(i) {
-		// Skip network and broadcast addresses for IPv4
-		if i.To4() != nil && scan.IsFirstOrLastAddress(i, ipnet) {
-			continue
-		}
-
-		newIP := make(net.IP, len(i))
-
-		copy(newIP, i)
-		ips = append(ips, newIP)
-	}
-
-	return ips, nil
 }
