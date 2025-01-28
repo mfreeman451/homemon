@@ -1,11 +1,9 @@
 package scan
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 )
 
@@ -15,146 +13,36 @@ type IPRange struct {
 	End   net.IP
 }
 
-// ParseIPSpec parses various IP specification formats and returns a slice of IPRange.
-// Supported formats:
-// - CIDR (192.168.1.0/24)
-// - Single IP (192.168.1.1)
-// - IP Range (192.168.1.1-192.168.1.10 or 192.168.1.1-10)
-func ParseIPSpec(spec string) ([]IPRange, error) {
-	// Split multiple specs by comma
-	specs := strings.Split(spec, ",")
-	var ranges []IPRange
-
-	for _, s := range specs {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
+// inc increments an IP address by one.
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
 		}
-
-		// Try parsing as CIDR
-		if strings.Contains(s, "/") {
-			r, err := parseCIDR(s)
-			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR %s: %w", s, err)
-			}
-			ranges = append(ranges, r)
-			continue
-		}
-
-		// Try parsing as range
-		if strings.Contains(s, "-") {
-			r, err := parseIPRange(s)
-			if err != nil {
-				return nil, fmt.Errorf("invalid IP range %s: %w", s, err)
-			}
-			ranges = append(ranges, r...)
-			continue
-		}
-
-		// Try parsing as single IP
-		ip := net.ParseIP(s)
-		if ip == nil {
-			return nil, fmt.Errorf("invalid IP address: %s", s)
-		}
-		ranges = append(ranges, IPRange{Start: ip, End: ip})
 	}
-
-	return ranges, nil
 }
 
-// parseCIDR parses a CIDR notation string and returns an IPRange.
-func parseCIDR(cidr string) (IPRange, error) {
+// parseIPCIDR parses a CIDR range and returns a slice of IP addresses
+func parseIPCIDR(cidr string) ([]net.IP, error) {
 	ip, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return IPRange{}, err
+		return nil, err
 	}
 
-	// Calculate the last IP in the network
-	mask := binary.BigEndian.Uint32(ipnet.Mask)
-	start := binary.BigEndian.Uint32(ip.To4())
-	end := (start & mask) | (^mask)
-
-	return IPRange{
-		Start: net.IPv4(byte(start>>24), byte(start>>16), byte(start>>8), byte(start)),
-		End:   net.IPv4(byte(end>>24), byte(end>>16), byte(end>>8), byte(end)),
-	}, nil
-}
-
-// parseIPRange parses an IP range string and returns a slice of IPRange.
-// Supports formats:
-// - Full range: 192.168.1.1-192.168.1.10
-// - Short range: 192.168.1.1-10
-func parseIPRange(rangeStr string) ([]IPRange, error) {
-	parts := strings.Split(rangeStr, "-")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid range format: %s", rangeStr)
-	}
-
-	start := net.ParseIP(strings.TrimSpace(parts[0]))
-	if start == nil {
-		return nil, fmt.Errorf("invalid start IP: %s", parts[0])
-	}
-
-	// Handle short format (192.168.1.1-10)
-	endStr := strings.TrimSpace(parts[1])
-	var end net.IP
-	if !strings.Contains(endStr, ".") {
-		// Parse the last octet
-		lastOctet, err := strconv.Atoi(endStr)
-		if err != nil || lastOctet < 0 || lastOctet > 255 {
-			return nil, fmt.Errorf("invalid end IP octet: %s", endStr)
-		}
-
-		// Copy the first three octets from start
-		end = make(net.IP, len(start))
-		copy(end, start)
-		end[len(end)-1] = byte(lastOctet)
-	} else {
-		end = net.ParseIP(endStr)
-		if end == nil {
-			return nil, fmt.Errorf("invalid end IP: %s", endStr)
-		}
-	}
-
-	// Ensure IPs are in correct order
-	if bytes.Compare(start, end) > 0 {
-		start, end = end, start
-	}
-
-	return []IPRange{{Start: start, End: end}}, nil
-}
-
-// GenerateIPs generates a slice of IP addresses from a slice of IPRange.
-func GenerateIPs(ranges []IPRange) []net.IP {
 	var ips []net.IP
-
-	for _, r := range ranges {
-		start := binary.BigEndian.Uint32(r.Start.To4())
-		end := binary.BigEndian.Uint32(r.End.To4())
-
-		for i := start; i <= end; i++ {
-			ip := make(net.IP, 4)
-			binary.BigEndian.PutUint32(ip, i)
-			ips = append(ips, ip)
-		}
+	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+		nextIP := make(net.IP, len(ip))
+		copy(nextIP, ip)
+		ips = append(ips, nextIP)
 	}
 
-	return ips
-}
-
-// ParseIPSpecFromStrings parses multiple IP specifications from a slice of strings.
-func ParseIPSpecFromStrings(specs []string) ([]IPRange, error) {
-	var allRanges []IPRange
-
-	for _, spec := range specs {
-		ranges, err := ParseIPSpec(spec)
-		if err != nil {
-			return nil, err
-		}
-		allRanges = append(allRanges, ranges...)
+	// Remove network and broadcast addresses for non-/32 networks
+	if len(ips) > 2 && ip.To4() != nil && !strings.HasSuffix(cidr, "/32") {
+		ips = ips[1 : len(ips)-1]
 	}
 
-	return allRanges, nil
+	return ips, nil
 }
 
 // GenerateIPsFromCIDR generates all IP addresses in a CIDR range.
@@ -213,4 +101,133 @@ func IsFirstOrLastAddress(ip net.IP, network *net.IPNet) bool {
 
 	// Check if it's the broadcast address (last address)
 	return ipv4.Equal(broadcast)
+}
+
+// GenerateIPs generates a slice of IPs from IPRange slice
+func GenerateIPs(ranges []IPRange) []net.IP {
+	var ips []net.IP
+
+	for _, r := range ranges {
+		start := binary.BigEndian.Uint32(r.Start.To4())
+		end := binary.BigEndian.Uint32(r.End.To4())
+
+		for i := start; i <= end; i++ {
+			ip := make(net.IP, 4)
+			binary.BigEndian.PutUint32(ip, i)
+			ips = append(ips, ip)
+		}
+	}
+
+	return ips
+}
+
+// ParseIPSpecFromStrings parses multiple IP specifications from a slice of strings
+func ParseIPSpecFromStrings(specs []string) ([]IPRange, error) {
+	var ranges []IPRange
+
+	for _, spec := range specs {
+		// Split by comma for multiple specifications
+		for _, s := range strings.Split(spec, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+
+			r, err := parseIPSpec(s)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse IP spec %s: %w", s, err)
+			}
+			ranges = append(ranges, r...)
+		}
+	}
+
+	return ranges, nil
+}
+
+// parseIPSpec parses either CIDR or IP range format.
+// For single IPs, converts them to /32 CIDR.
+func parseIPSpec(spec string) ([]IPRange, error) {
+	// Handle IP range format (e.g., 192.168.1.1-192.168.1.10 or 192.168.1.1-10)
+	if strings.Contains(spec, "-") {
+		return parseIPRange(spec)
+	}
+
+	// If it's a CIDR or single IP, convert to range
+	cidrSpec := spec
+	if !strings.Contains(spec, "/") {
+		// Convert single IP to /32 CIDR
+		cidrSpec = spec + "/32"
+	}
+
+	ipRange, err := parseCIDR(cidrSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	return []IPRange{ipRange}, nil
+}
+
+// parseCIDR converts a CIDR notation to an IPRange
+func parseCIDR(cidr string) (IPRange, error) {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return IPRange{}, err
+	}
+
+	// Calculate the last IP in the network
+	mask := binary.BigEndian.Uint32(ipnet.Mask)
+	start := binary.BigEndian.Uint32(ip.To4())
+	end := (start & mask) | (^mask)
+
+	startIP := make(net.IP, 4)
+	endIP := make(net.IP, 4)
+	binary.BigEndian.PutUint32(startIP, start)
+	binary.BigEndian.PutUint32(endIP, end)
+
+	return IPRange{Start: startIP, End: endIP}, nil
+}
+
+// parseIPRange parses an IP range string into IPRange(s)
+// Supports formats:
+// - Full range: 192.168.1.1-192.168.1.10
+// - Short range: 192.168.1.1-10
+func parseIPRange(ipRange string) ([]IPRange, error) {
+	parts := strings.Split(ipRange, "-")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid range format: %s", ipRange)
+	}
+
+	startIP := net.ParseIP(strings.TrimSpace(parts[0]))
+	if startIP == nil || startIP.To4() == nil {
+		return nil, fmt.Errorf("invalid start IP: %s", parts[0])
+	}
+
+	var endIP net.IP
+	endStr := strings.TrimSpace(parts[1])
+
+	if !strings.Contains(endStr, ".") {
+		// Short format: use last octet only
+		octets := strings.Split(startIP.String(), ".")
+		lastOctet := endStr
+		endIP = net.ParseIP(fmt.Sprintf("%s.%s.%s.%s",
+			octets[0], octets[1], octets[2], lastOctet))
+		if endIP == nil {
+			return nil, fmt.Errorf("invalid end IP octet: %s", endStr)
+		}
+	} else {
+		// Full IP format
+		endIP = net.ParseIP(endStr)
+		if endIP == nil || endIP.To4() == nil {
+			return nil, fmt.Errorf("invalid end IP: %s", endStr)
+		}
+	}
+
+	// Ensure correct order
+	startInt := binary.BigEndian.Uint32(startIP.To4())
+	endInt := binary.BigEndian.Uint32(endIP.To4())
+	if startInt > endInt {
+		startIP, endIP = endIP, startIP
+	}
+
+	return []IPRange{{Start: startIP, End: endIP}}, nil
 }
