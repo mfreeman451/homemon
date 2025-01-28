@@ -139,13 +139,38 @@ const ServiceDashboard = () => {
 
         // Handle sweep service type
         if (serviceData.type === 'sweep') {
-            return (
-                <NetworkSweepView
-                    nodeId={nodeId}
-                    service={serviceData}
-                    standalone={true}
-                />
-            );
+            let sweepDetails;
+            try {
+                sweepDetails = typeof serviceData.message === 'string'
+                    ? JSON.parse(serviceData.message)
+                    : serviceData.message;
+
+                if (!sweepDetails) {
+                    return (
+                        <div className="bg-white rounded-lg shadow p-6">
+                            <div className="text-red-500">No sweep data available</div>
+                        </div>
+                    );
+                }
+
+                // Add sweep details to the service data
+                serviceData.details = sweepDetails;
+
+                return (
+                    <NetworkSweepView
+                        nodeId={nodeId}
+                        service={serviceData}
+                        standalone={true}
+                    />
+                );
+            } catch (err) {
+                console.error('Error parsing sweep data:', err);
+                return (
+                    <div className="bg-white rounded-lg shadow p-6">
+                        <div className="text-red-500">Error parsing sweep data: {err.message}</div>
+                    </div>
+                );
+            }
         }
 
         // Handle ICMP service type
@@ -200,6 +225,14 @@ const ServiceDashboard = () => {
             </div>
         );
     }
+
+    // Debug section
+    console.log('ServiceDashboard state:', {
+        serviceData,
+        error,
+        metricsData,
+        selectedTimeRange
+    });
 
     if (error) {
         return (

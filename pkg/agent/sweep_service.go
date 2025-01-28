@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -75,49 +76,6 @@ func (s *SweepService) Start(ctx context.Context) error {
 	}
 }
 
-func (s *SweepService) generateTargets() ([]models.Target, error) {
-	var allTargets []models.Target
-
-	for _, network := range s.config.Networks {
-		// First generate all IP addresses
-		ips, err := scan.GenerateIPsFromCIDR(network)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate IPs for %s: %w", network, err)
-		}
-
-		// For each IP, create ICMP target if enabled
-		if containsMode(s.config.SweepModes, models.ModeICMP) {
-			for _, ip := range ips {
-				allTargets = append(allTargets, models.Target{
-					Host: ip.String(),
-					Mode: models.ModeICMP,
-				})
-			}
-		}
-
-		// For each IP, create TCP targets for each port if enabled
-		if containsMode(s.config.SweepModes, models.ModeTCP) {
-			for _, ip := range ips {
-				for _, port := range s.config.Ports {
-					allTargets = append(allTargets, models.Target{
-						Host: ip.String(),
-						Port: port,
-						Mode: models.ModeTCP,
-					})
-				}
-			}
-		}
-	}
-
-	log.Printf("Generated %d targets from %d networks (%d ports, modes: %v)",
-		len(allTargets),
-		len(s.config.Networks),
-		len(s.config.Ports),
-		s.config.SweepModes)
-
-	return allTargets, nil
-}
-
 // Helper function to check if a mode is in the list of modes.
 func containsMode(modes []models.SweepMode, mode models.SweepMode) bool {
 	for _, m := range modes {
@@ -178,12 +136,13 @@ func NewSweepService(config *models.Config) (*SweepService, error) {
 		config.ICMPCount,
 	)
 
-	// Create processor instance (which now handles both processing and storage)
+	// Create processor instance
 	processor := sweeper.NewBaseProcessor()
 
-	// Create an in-memory store that references the same processor if needed:
+	// Create an in-memory store that references the same processor
 	store := sweeper.NewInMemoryStore(processor)
 
+	// Create a new sweep service with a manager, service name, and configuration
 	service := &SweepService{
 		scanner:   scanner,
 		store:     store,
@@ -193,6 +152,77 @@ func NewSweepService(config *models.Config) (*SweepService, error) {
 	}
 
 	return service, nil
+}
+
+func (s *SweepService) generateTargets() ([]models.Target, error) {
+	var allTargets []models.Target
+	var allIPs []net.IP
+
+	// Process each network specification
+	for _, networkSpec := range s.config.Networks {
+		log.Printf("Processing network specification: %s", networkSpec)
+
+		var ips []net.IP
+		var err error
+
+		if strings.Contains(networkSpec, "-") {
+			// Handle IP range format
+			ranges, err := scan.ParseIPRange(networkSpec)
+			if err != nil {
+				log.Printf("Failed to parse IP range %s: %v", networkSpec, err)
+				return nil, fmt.Errorf("failed to parse IP range %s: %w", networkSpec, err)
+			}
+			for _, r := range ranges {
+				rangeIPs := scan.GenerateIPsFromRange(r)
+				ips = append(ips, rangeIPs...)
+			}
+		} else {
+			// Handle CIDR or single IP format
+			ips, err = scan.GenerateIPsFromCIDR(networkSpec)
+			if err != nil {
+				log.Printf("Failed to generate IPs from CIDR %s: %v", networkSpec, err)
+				return nil, fmt.Errorf("failed to generate IPs from CIDR %s: %w", networkSpec, err)
+			}
+		}
+
+		log.Printf("Generated %d IPs from %s", len(ips), networkSpec)
+		allIPs = append(allIPs, ips...)
+	}
+
+	// Deduplicate IPs
+	uniqueIPs := make(map[string]net.IP)
+	for _, ip := range allIPs {
+		uniqueIPs[ip.String()] = ip
+	}
+
+	log.Printf("Total unique IPs after deduplication: %d", len(uniqueIPs))
+
+	// Create ICMP targets if enabled
+	if containsMode(s.config.SweepModes, models.ModeICMP) {
+		for _, ip := range uniqueIPs {
+			allTargets = append(allTargets, models.Target{
+				Host: ip.String(),
+				Mode: models.ModeICMP,
+			})
+		}
+		log.Printf("Created %d ICMP targets", len(uniqueIPs))
+	}
+
+	// Create TCP targets for each port if enabled
+	if containsMode(s.config.SweepModes, models.ModeTCP) {
+		for _, ip := range uniqueIPs {
+			for _, port := range s.config.Ports {
+				allTargets = append(allTargets, models.Target{
+					Host: ip.String(),
+					Port: port,
+					Mode: models.ModeTCP,
+				})
+			}
+		}
+		log.Printf("Created %d TCP targets", len(uniqueIPs)*len(s.config.Ports))
+	}
+
+	return allTargets, nil
 }
 
 func (s *SweepService) Stop() error {

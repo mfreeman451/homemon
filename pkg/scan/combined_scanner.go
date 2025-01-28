@@ -40,11 +40,16 @@ func NewCombinedScanner(timeout time.Duration, concurrency, icmpCount int) *Comb
 		}
 	}
 
-	return &CombinedScanner{
+	scanner := &CombinedScanner{
 		tcpScanner:  NewTCPScanner(timeout, concurrency),
 		icmpScanner: icmpScanner,
 		done:        make(chan struct{}),
 	}
+
+	log.Printf("Created combined scanner with timeout=%v, concurrency=%d, icmpCount=%d",
+		timeout, concurrency, icmpCount)
+
+	return scanner
 }
 
 func (s *CombinedScanner) Scan(ctx context.Context, targets []models.Target) (<-chan models.Result, error) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -104,28 +105,31 @@ func (m *SweepMode) MarshalJSON() ([]byte, error) {
 }
 
 func (s *NetworkSweeper) generateTargets() ([]models.Target, error) {
-	// Parse all IP specifications
-	ranges, err := scan.ParseIPSpecFromStrings(s.config.Networks)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse network specifications: %w", err)
+	var allTargets []models.Target
+	var allIPs []net.IP
+
+	// Process each network specification
+	for _, networkSpec := range s.config.Networks {
+		log.Printf("Processing network specification: %s", networkSpec)
+		ips, err := scan.GenerateIPsFromSpec(networkSpec)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate IPs from spec %s: %w", networkSpec, err)
+		}
+		log.Printf("Generated %d IPs from %s", len(ips), networkSpec)
+		allIPs = append(allIPs, ips...)
 	}
 
-	// Generate IPs from ranges
-	ips := scan.GenerateIPs(ranges)
+	// Deduplicate IPs
+	uniqueIPs := make(map[string]net.IP)
+	for _, ip := range allIPs {
+		uniqueIPs[ip.String()] = ip
+	}
 
-	log.Printf("Generated %d unique IP addresses from network specifications", len(ips))
-
-	var allTargets []models.Target
+	log.Printf("Total unique IPs after deduplication: %d", len(uniqueIPs))
 
 	// Create ICMP targets if enabled
 	if containsMode(s.config.SweepModes, models.ModeICMP) {
-		for _, ip := range ips {
-			// Skip network and broadcast addresses for IPv4
-			if ip.To4() != nil {
-				if ip[15] == 0 || ip[15] == 255 {
-					continue
-				}
-			}
+		for _, ip := range uniqueIPs {
 			allTargets = append(allTargets, models.Target{
 				Host: ip.String(),
 				Mode: models.ModeICMP,
@@ -135,13 +139,7 @@ func (s *NetworkSweeper) generateTargets() ([]models.Target, error) {
 
 	// Create TCP targets for each port if enabled
 	if containsMode(s.config.SweepModes, models.ModeTCP) {
-		for _, ip := range ips {
-			// Skip network and broadcast addresses for IPv4
-			if ip.To4() != nil {
-				if ip[15] == 0 || ip[15] == 255 {
-					continue
-				}
-			}
+		for _, ip := range uniqueIPs {
 			for _, port := range s.config.Ports {
 				allTargets = append(allTargets, models.Target{
 					Host: ip.String(),
@@ -152,11 +150,8 @@ func (s *NetworkSweeper) generateTargets() ([]models.Target, error) {
 		}
 	}
 
-	log.Printf("Generated %d targets for scanning (%d IPs, %d ports, modes: %v)",
-		len(allTargets),
-		len(ips),
-		len(s.config.Ports),
-		s.config.SweepModes)
+	log.Printf("Generated %d total targets (ICMP and TCP) from %d unique IPs",
+		len(allTargets), len(uniqueIPs))
 
 	return allTargets, nil
 }
