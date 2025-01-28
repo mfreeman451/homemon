@@ -241,12 +241,6 @@ func (s *SweepService) GetStatus(ctx context.Context) (*proto.StatusResponse, er
 	for i := range summary.Hosts {
 		host := &summary.Hosts[i]
 		if host.ICMPStatus != nil {
-			log.Printf("Processing ICMP status for host %s: available=%v rtt=%v loss=%v",
-				host.Host,
-				host.ICMPStatus.Available,
-				host.ICMPStatus.RoundTrip,
-				host.ICMPStatus.PacketLoss)
-
 			// Ensure RoundTrip is properly set in nanoseconds
 			if host.ICMPStatus.Available {
 				host.ResponseTime = host.ICMPStatus.RoundTrip
