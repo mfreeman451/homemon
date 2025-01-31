@@ -1,8 +1,6 @@
 # Stage 1: Build the web UI
 FROM --platform=linux/amd64 node:18-bullseye AS web-builder
-
 WORKDIR /web-build
-
 COPY web/package*.json ./
 RUN npm install
 COPY web/ .
@@ -10,7 +8,6 @@ RUN npm run build
 
 # Stage 2: Build the Go binary
 FROM --platform=linux/amd64 golang:1.23-bullseye
-
 WORKDIR /src
 
 # Install build dependencies
@@ -32,3 +29,9 @@ COPY --from=web-builder /web-build/dist ./pkg/cloud/api/web/dist
 # Build the cloud service
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     go build -o serviceradar-cloud ./cmd/cloud
+
+# Optional: Create a smaller final image (if you want to deploy the image)
+# FROM gcr.io/distroless/base-debian12
+# WORKDIR /app
+# COPY --from=builder /src/serviceradar-cloud /app/
+# ENTRYPOINT ["/app/serviceradar-cloud"]

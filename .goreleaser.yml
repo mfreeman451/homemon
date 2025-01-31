@@ -1,10 +1,11 @@
-project_name: serviceradar
-
 before:
   hooks:
-    - go mod tidy
+    - ./scripts/build-cloud.sh {{ .Version }}
 
 builds:
+  - id: cloud
+    skip: true # Skip building, we are doing this in the before hook
+    no_unique_dist_dir: true
   - id: agent
     main: ./cmd/agent/main.go
     binary: serviceradar-agent
@@ -14,9 +15,6 @@ builds:
       - linux
     goarch:
       - amd64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
   - id: poller
     main: ./cmd/poller/main.go
     binary: serviceradar-poller
@@ -26,9 +24,6 @@ builds:
       - linux
     goarch:
       - amd64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
   - id: dusk-checker
     main: ./cmd/checkers/dusk/main.go
     binary: serviceradar-dusk-checker
@@ -38,82 +33,17 @@ builds:
       - linux
     goarch:
       - amd64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
-  - id: serviceradar-cloud
-    main: ./cmd/cloud/main.go
-    binary: serviceradar-cloud
-    dir: .
-    goos:
-      - linux
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-    hooks:
-      pre:
-        - ./scripts/build-cloud.sh {{ .Version }}
-
+env_files:
+  github_token: ~/.config/goreleaser/github_token
 nfpms:
-  - id: agent
-    package_name: serviceradar-agent
-    file_name_template: "{{ .PackageName }}_{{ .Version }}"
-    builds:
-      - agent
-    vendor: ServiceRadar
-    homepage: https://github.com/mfreeman451/serviceradar
-    maintainer: Michael Freeman <mfreeman451@gmail.com>
-    description: ServiceRadar Agent Component
-    license: MIT
-    formats:
-      - deb
-    dependencies:
-      - systemd
-    contents:
-      - src: ./packaging/agent/systemd/serviceradar-agent.service
-        dst: /lib/systemd/system/serviceradar-agent.service
-      - src: ./packaging/agent/config/agent.json
-        dst: /etc/serviceradar/agent.json
-        type: config
-    scripts:
-      postinstall: ./packaging/agent/scripts/postinstall.sh
-      preremove: ./packaging/agent/scripts/preremove.sh
-
-  - id: poller
-    package_name: serviceradar-poller
-    file_name_template: "{{ .PackageName }}_{{ .Version }}"
-    builds:
-      - poller
-    vendor: ServiceRadar
-    homepage: https://github.com/mfreeman451/serviceradar
-    maintainer: Michael Freeman <mfreeman451@gmail.com>
-    description: ServiceRadar Poller Component
-    license: MIT
-    formats:
-      - deb
-    dependencies:
-      - systemd
-    contents:
-      - src: ./packaging/poller/systemd/serviceradar-poller.service
-        dst: /lib/systemd/system/serviceradar-poller.service
-      - src: ./packaging/poller/config/poller.json
-        dst: /etc/serviceradar/poller.json
-        type: config
-    scripts:
-      postinstall: ./packaging/poller/scripts/postinstall.sh
-      preremove: ./packaging/poller/scripts/preremove.sh
-
   - id: cloud
     package_name: serviceradar-cloud
     file_name_template: "{{ .PackageName }}_{{ .Version }}"
-    builds:
-      - serviceradar-cloud
     vendor: ServiceRadar
     homepage: https://github.com/mfreeman451/serviceradar
     maintainer: Michael Freeman <mfreeman451@gmail.com>
-    description: ServiceRadar Cloud Component
-    license: MIT
+    description: ServiceRadar cloud service with web interface
+    license: Apache 2.0
     formats:
       - deb
     dependencies:
@@ -121,81 +51,15 @@ nfpms:
     contents:
       - src: dist/cloud_linux_amd64_v1/serviceradar-cloud
         dst: /usr/local/bin/serviceradar-cloud
-      - src: ./packaging/cloud/systemd/serviceradar-cloud.service
-        dst: /lib/systemd/system/serviceradar-cloud.service
-      - src: ./packaging/cloud/config/cloud.json
-        dst: /etc/serviceradar/cloud.json
-        type: config
+        file_info:
+          mode: 0755
       - src: pkg/cloud/api/web/dist
         dst: /usr/local/share/serviceradar-cloud/web/dist
-        type: "tree"
-    scripts:
-      postinstall: ./packaging/cloud/scripts/postinstall.sh
-      preremove: ./packaging/cloud/scripts/preremove.sh
-
-  - id: dusk-checker
-    package_name: serviceradar-dusk-checker
-    file_name_template: "{{ .PackageName }}_{{ .Version }}"
-    builds:
-      - dusk-checker
-    vendor: ServiceRadar
-    homepage: https://github.com/mfreeman451/serviceradar
-    maintainer: Michael Freeman <mfreeman451@gmail.com>
-    description: ServiceRadar Dusk Checker Component
-    license: MIT
-    formats:
-      - deb
-    dependencies:
-      - systemd
-    contents:
-      - src: ./packaging/dusk/config/dusk.json
-        dst: /etc/serviceradar/checkers/dusk.json
-        type: config
-      - src: ./packaging/dusk/config/external.json
-        dst: /etc/serviceradar/checkers/external.json
+      - src: packaging/cloud/systemd/serviceradar-cloud.service
+        dst: /lib/systemd/system/serviceradar-cloud.service
+      - src: packaging/cloud/config/cloud.json
+        dst: /etc/serviceradar/cloud.json
         type: config
     scripts:
-      postinstall: ./packaging/dusk/scripts/postinstall.sh
-      preremove: ./packaging/dusk/scripts/preremove.sh
-
-release:
-  github:
-    owner: mfreeman451
-    name: serviceradar
-  draft: true
-  prerelease: auto
-  mode: replace
-  header: |
-    # ServiceRadar {{ .Version }}
-    Release of ServiceRadar monitoring system.
-
-    ## Components
-    - serviceradar-dusk-checker: Agent package for monitoring Dusk nodes
-    - serviceradar-agent: Agent performs checks, collects information from external checkers (dusk)
-    - serviceradar-poller: Network poller for collecting monitoring data from Agent
-    - serviceradar-cloud: Cloud service with web interface and alerts
-
-    ## Installation
-    See the [README.md](README.md) for detailed installation instructions.
-
-    ### Quick Start
-    ```bash
-    # On Agents:
-    sudo dpkg -i serviceradar-agent_{{ .Version }}.deb
-    # With Dusk Checker (on agent)
-    sudo dpkg -i serviceradar-dusk-checker_{{ .Version }}.deb
-    # On monitoring host (can co-locate with agent):
-    sudo dpkg -i serviceradar-poller_{{ .Version }}.deb
-    # On cloud host (can co-locate with poller+agent):
-    sudo dpkg -i serviceradar-cloud_{{ .Version }}.deb
-    ```
-
-changelog:
-  sort: asc
-  filters:
-    exclude:
-      - '^docs:'
-      - '^test:'
-      - '^ci:'
-      - 'Merge pull request'
-      - 'Merge branch'
+      postinstall: packaging/cloud/scripts/postinstall.sh
+      preremove: packaging/cloud/scripts/preremove.sh

@@ -1,30 +1,26 @@
-FROM --platform=linux/amd64 golang:1.23-bullseye
+FROM node:18-bullseye AS web-builder
 
-# Install Node.js and npm
-RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
-    && apt-get update \
-    && apt-get install -y \
-        gcc \
-        libc6-dev \
-        libsqlite3-dev \
-        make \
-        nodejs \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /web-build
+
+COPY web/package*.json ./
+RUN npm install
+COPY web/ .
+RUN npm run build
+
+FROM golang:1.23-bullseye
 
 WORKDIR /src
 
-# Copy go mod files first for better caching
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libc6-dev \
+    libsqlite3-dev
+
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the rest of the source
 COPY . .
+COPY --from=web-builder /web-build/dist ./pkg/cloud/api/web/dist
 
-# Build web interface
-RUN cd web && npm install && npm run build \
-    && mkdir -p /src/pkg/cloud/api/web \
-    && cp -r dist /src/pkg/cloud/api/web/
-
-# Build the cloud service
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     go build -o serviceradar-cloud ./cmd/cloud
