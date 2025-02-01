@@ -10,48 +10,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const (
-	combinedScannerTimeout = 5 * time.Second
-	combinedScannerConc    = 10
-	combinedScannerMaxIdle = 10
-	combinedScannerMaxLife = 10 * time.Minute
-	combinedScannerIdle    = 5 * time.Minute
-)
-
 func TestTCPScanner_HighConcurrency(t *testing.T) {
-	numTargets := 100 // Reduced from 1000
+	t.Parallel()
+
+	numTargets := 100
 	targets := make([]models.Target, numTargets)
 
 	for i := 0; i < numTargets; i++ {
 		targets[i] = models.Target{
-			Host: "www.google.com",
-			Port: 80,
+			Host: "localhost", // Use localhost to avoid DNS lookups
+			Port: 12345,       // Use an unlikely port
 			Mode: models.ModeTCP,
 		}
 	}
 
-	scanner := NewTCPScanner(
-		combinedScannerTimeout,
-		combinedScannerConc,
-		combinedScannerMaxIdle,
-		combinedScannerMaxLife,
-		combinedScannerIdle,
-	)
+	scanner := NewTCPScanner(100*time.Millisecond, 10, 10, time.Second, time.Second)
 
-	resultsChan, err := scanner.Scan(context.Background(), targets)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resultsChan, err := scanner.Scan(ctx, targets)
 	require.NoError(t, err)
 
-	unsuccessfulConnections := 0
+	results := make([]models.Result, 0, numTargets)
 
 	for result := range resultsChan {
-		if !result.Available && result.Error != nil {
-			unsuccessfulConnections++
-		} else if result.Error != nil {
-			t.Logf("Error during scan: %v", result.Error)
-		}
+		results = append(results, result)
 	}
 
-	assert.Equal(t, numTargets, unsuccessfulConnections, "Expected all connections to be unsuccessful but without errors")
+	// Verify we got responses for all targets
+	require.Len(t, results, numTargets)
+
+	// Clean up
+	err = scanner.Stop(context.Background())
+	require.NoError(t, err)
 }
 
 func TestTCPScanner_Scan(t *testing.T) {

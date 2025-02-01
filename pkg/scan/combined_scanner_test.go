@@ -89,34 +89,87 @@ func TestNewCombinedScanner_ICMPError(t *testing.T) {
 }
 
 func TestCombinedScanner_Scan_MixedTargets(t *testing.T) {
-	scanner := NewCombinedScanner(1*time.Second, 1, 3, 1, 1, 1)
+	t.Parallel() // Allow parallel test execution
+
+	ctrl, ctx := gomock.WithContext(context.Background(), t)
+	defer ctrl.Finish()
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	mockTCP := NewMockScanner(ctrl)
+	mockICMP := NewMockScanner(ctrl)
 
 	targets := []models.Target{
-		{Host: "127.0.0.1", Port: 22, Mode: models.ModeTCP},
-		{Host: "127.0.0.1", Mode: models.ModeICMP},
+		{Host: "192.168.1.1", Port: 80, Mode: models.ModeTCP},
+		{Host: "192.168.1.2", Mode: models.ModeICMP},
 	}
 
-	results, err := scanner.Scan(context.Background(), targets)
+	tcpResults := make(chan models.Result, 1)
+	icmpResults := make(chan models.Result, 1)
+
+	// Send results and close channels in goroutines
+	go func() {
+		tcpResults <- models.Result{
+			Target: models.Target{
+				Host: "192.168.1.1",
+				Port: 80,
+				Mode: models.ModeTCP,
+			},
+			Available: true,
+		}
+		close(tcpResults)
+	}()
+
+	go func() {
+		icmpResults <- models.Result{
+			Target: models.Target{
+				Host: "192.168.1.2",
+				Mode: models.ModeICMP,
+			},
+			Available: true,
+		}
+		close(icmpResults)
+	}()
+
+	mockTCP.EXPECT().
+		Scan(gomock.Any(), matchTargets(models.ModeTCP)).
+		Return(tcpResults, nil)
+
+	mockICMP.EXPECT().
+		Scan(gomock.Any(), matchTargets(models.ModeICMP)).
+		Return(icmpResults, nil)
+
+	scanner := &CombinedScanner{
+		tcpScanner:  mockTCP,
+		icmpScanner: mockICMP,
+		done:        make(chan struct{}),
+	}
+
+	results, err := scanner.Scan(ctx, targets)
 	require.NoError(t, err)
 
-	var resultCount int
-	for result := range results {
-		resultCount++
+	// Collect results with timeout
+	var gotResults []models.Result
 
-		if result.Target.Mode == models.ModeICMP && !result.Available {
-			t.Log("ICMP scanning not available, skipping ICMP result check")
+	resultsDone := make(chan struct{})
 
-			continue
+	go func() {
+		defer close(resultsDone)
+
+		for result := range results {
+			gotResults = append(gotResults, result)
 		}
+	}()
+
+	select {
+	case <-resultsDone:
+	case <-ctx.Done():
+		t.Fatal("Test timed out waiting for results")
 	}
 
-	// If ICMP scanning is not available, expect only TCP results
-	expectedResults := 1
-	if scanner.icmpScanner != nil {
-		expectedResults = len(targets)
-	}
-
-	require.Equal(t, expectedResults, resultCount, "Expected results for all targets")
+	require.Len(t, gotResults, 2, "Expected 2 results")
 }
 
 // TestCombinedScanner_ScanBasic tests basic scanner functionality.

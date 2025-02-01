@@ -102,7 +102,6 @@ func (s *CombinedScanner) Scan(ctx context.Context, targets []models.Target) (<-
 }
 
 const (
-	errorChannelSize  = 2
 	workerChannelSize = 2
 )
 
@@ -114,8 +113,6 @@ type scanWorker struct {
 
 func (s *CombinedScanner) handleMixedScanners(ctx context.Context, targets scanTargets) (<-chan models.Result, error) {
 	results := make(chan models.Result, len(targets.tcp)+len(targets.icmp))
-	resultsClosed := make(chan struct{})
-	errCh := make(chan error, errorChannelSize)
 
 	var wg sync.WaitGroup
 
@@ -127,25 +124,43 @@ func (s *CombinedScanner) handleMixedScanners(ctx context.Context, targets scanT
 		if len(w.targets) > 0 {
 			wg.Add(1)
 
-			go s.runScanWorker(ctx, w, &wg, results, resultsClosed, errCh)
+			go func(worker scanWorker) {
+				defer wg.Done()
+
+				scanResults, err := worker.scanner.Scan(ctx, worker.targets)
+				if err != nil {
+					log.Printf("Error from %s scanner: %v", worker.name, err)
+
+					return
+				}
+
+				// Forward results
+				for {
+					select {
+					case result, ok := <-scanResults:
+						if !ok {
+							return
+						}
+						select {
+						case results <- result:
+						case <-ctx.Done():
+							return
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}(w)
 		}
 	}
 
-	// Handle cleanup
+	// Close results when all workers are done
 	go func() {
 		wg.Wait()
-		close(resultsClosed)
 		close(results)
 	}()
 
-	// Check for immediate errors
-	select {
-	case err := <-errCh:
-		close(resultsClosed)
-		return results, err
-	default:
-		return results, nil
-	}
+	return results, nil
 }
 
 func (s *CombinedScanner) setupWorkers(targets scanTargets) []scanWorker {
@@ -168,59 +183,6 @@ func (s *CombinedScanner) setupWorkers(targets scanTargets) []scanWorker {
 	}
 
 	return workers
-}
-
-func (s *CombinedScanner) runScanWorker(
-	ctx context.Context,
-	worker scanWorker,
-	wg *sync.WaitGroup,
-	results chan<- models.Result,
-	resultsClosed <-chan struct{},
-	errCh chan<- error,
-) {
-	defer wg.Done()
-
-	scanResults, err := worker.scanner.Scan(ctx, worker.targets)
-
-	if err != nil {
-		select {
-		case errCh <- fmt.Errorf("%s scan error: %w", worker.name, err):
-		default:
-		}
-
-		return
-	}
-
-	s.forwardWorkerResults(ctx, scanResults, results, resultsClosed)
-}
-
-func (s *CombinedScanner) forwardWorkerResults(
-	ctx context.Context,
-	in <-chan models.Result,
-	results chan<- models.Result,
-	resultsClosed <-chan struct{},
-) {
-	for {
-		select {
-		case result, ok := <-in:
-			if !ok {
-				return
-			}
-			select {
-			case <-resultsClosed:
-				return
-			case <-ctx.Done():
-				return
-			case results <- result:
-			}
-		case <-ctx.Done():
-			return
-		case <-resultsClosed:
-			return
-		case <-s.done:
-			return
-		}
-	}
 }
 
 type scanResult struct {

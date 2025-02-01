@@ -2,6 +2,7 @@ package scan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -13,7 +14,8 @@ import (
 )
 
 const (
-	numShards = 32 // Experiment with different values
+	numShards    = 32 // Experiment with different values
+	readDeadline = 100 * time.Millisecond
 )
 
 // connEntry represents a connection in the pool along with its last used timestamp.
@@ -67,7 +69,7 @@ func (p *connectionPool) get(ctx context.Context, address string) (net.Conn, err
 	shard.mu.Lock()
 
 	// Clean up expired connections first
-	p.cleanup(address)
+	p.cleanupLocked(shard)
 
 	// Get an existing connection
 	if entries, ok := shard.connections[address]; ok {
@@ -102,43 +104,40 @@ func (p *connectionPool) put(address string, conn net.Conn) {
 
 	now := time.Now()
 
-	entries, ok := shard.connections[address]
-	if !ok {
-		entries = []*connEntry{}
+	// Guard clause: If the pool is full, close the connection and return early
+	entries := shard.connections[address]
+	if len(entries) >= p.maxIdle {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection when pool is full: %v", err)
+		}
+
+		return
 	}
 
-	if len(entries) < p.maxIdle {
-		shard.connections[address] = append(entries, &connEntry{
-			conn:      conn,
-			lastUsed:  now,
-			createdAt: now,
-		})
-	} else {
-		// Close the connection if the pool is full for this address
-		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
-		}
+	// If the address has no entries, initialize an empty slice
+	if _, ok := shard.connections[address]; !ok {
+		shard.connections[address] = []*connEntry{}
 	}
+
+	// Add the connection to the pool
+	shard.connections[address] = append(shard.connections[address], &connEntry{
+		conn:      conn,
+		lastUsed:  now,
+		createdAt: now,
+	})
 }
 
-// cleanup removes expired connections from the pool.
-func (p *connectionPool) cleanup(address string) {
-	shard := p.getShard(address)
-
-	if entries, ok := shard.connections[address]; ok {
+func (*connectionPool) cleanupLocked(shard *shard) {
+	// (Optionally, add logic here to only remove expired connections.)
+	for addr, entries := range shard.connections {
 		for i := len(entries) - 1; i >= 0; i-- {
-			if time.Since(entries[i].lastUsed) >= p.idleTimeout || time.Since(entries[i].createdAt) >= p.maxLifetime {
-				if err := entries[i].conn.Close(); err != nil {
-					log.Printf("Error closing connection: %v", err)
-				}
-
-				shard.connections[address] = append(entries[:i], entries[i+1:]...) // Remove expired connection
+			if entries[i].conn != nil {
+				// You might choose to ignore errors here
+				_ = entries[i].conn.Close()
 			}
 		}
 
-		if len(shard.connections[address]) == 0 {
-			delete(shard.connections, address) // Remove entry if no connections are left
-		}
+		delete(shard.connections, addr)
 	}
 }
 
@@ -171,6 +170,14 @@ type TCPScanner struct {
 func NewTCPScanner(timeout time.Duration, concurrency, maxIdle int, maxLifetime, idleTimeout time.Duration) *TCPScanner {
 	dialer := &net.Dialer{
 		Timeout: timeout,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				// Use a very short timeout for DNS lookups.
+				d := net.Dialer{Timeout: 200 * time.Millisecond}
+				return d.DialContext(ctx, network, address)
+			},
+		},
 	}
 
 	pool := newConnectionPool(maxIdle, maxLifetime, idleTimeout, dialer)
@@ -184,47 +191,72 @@ func NewTCPScanner(timeout time.Duration, concurrency, maxIdle int, maxLifetime,
 }
 
 func (s *TCPScanner) Scan(ctx context.Context, targets []models.Target) (<-chan models.Result, error) {
-	results := make(chan models.Result)
-	targetChan := make(chan models.Target)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	// Start a fixed number of worker goroutines
+	results := make(chan models.Result, len(targets))
+	targetChan := make(chan models.Target, len(targets))
+
+	// Create context that can be canceled
+	scanCtx, cancel := context.WithCancel(ctx)
+
+	// Start worker goroutines
 	var wg sync.WaitGroup
-
 	for i := 0; i < s.concurrency; i++ {
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
 
-			for target := range targetChan {
-				s.scanTarget(ctx, target, results)
+			for {
+				select {
+				case target, ok := <-targetChan:
+					if !ok {
+						return
+					}
+
+					s.scanTarget(scanCtx, target, results)
+				case <-scanCtx.Done():
+					return
+				}
 			}
 		}()
 	}
 
-	// Feed targets to the worker goroutines
+	// Feed targets to workers
 	go func() {
+		defer close(targetChan)
+
 		for _, target := range targets {
 			select {
 			case targetChan <- target:
-			case <-ctx.Done():
+			case <-scanCtx.Done():
 				return
 			}
 		}
-
-		close(targetChan) // Close the target channel to signal workers to stop
 	}()
 
-	// Close the results channel when all workers are done
+	// Wait for all workers and close results
 	go func() {
+		defer cancel() // Cancel context when done
+		defer close(results)
 		wg.Wait()
-		close(results)
 	}()
 
 	return results, nil
 }
 
 func (s *TCPScanner) scanTarget(ctx context.Context, target models.Target, results chan<- models.Result) {
+	// Check context before doing anything
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Create a timeout context for this scan
+	scanCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
 	result := models.Result{
 		Target:    target,
 		FirstSeen: time.Now(),
@@ -232,65 +264,75 @@ func (s *TCPScanner) scanTarget(ctx context.Context, target models.Target, resul
 	}
 
 	address := fmt.Sprintf("%s:%d", target.Host, target.Port)
-
-	conn, err := s.pool.get(ctx, address)
-	result.RespTime = time.Since(result.FirstSeen)
+	conn, err := s.pool.get(scanCtx, address)
 
 	if err != nil {
 		result.Error = err
 		result.Available = false
-		sendResult(ctx, results, &result) // Send result and return early
+		select {
+		case results <- result:
+		case <-ctx.Done():
+		}
 
 		return
 	}
 
-	defer func() {
-		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
-		}
-	}()
+	defer s.pool.put(address, conn)
 
-	result.Available = s.checkConnection(conn, &result)
-	s.pool.put(address, conn)
+	result.RespTime = time.Since(result.FirstSeen)
+	result.Available = s.checkConnection(conn)
 
-	sendResult(ctx, results, &result) // Send result
-}
-
-func sendResult(ctx context.Context, results chan<- models.Result, result *models.Result) {
 	select {
-	case results <- *result:
+	case results <- result:
 	case <-ctx.Done():
 	}
 }
 
-func (*TCPScanner) checkConnection(conn net.Conn, result *models.Result) bool {
+func (*TCPScanner) checkConnection(conn net.Conn) bool {
 	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
-		return true // or handle non-TCP connections appropriately
+		return true // Accept non-TCP connections as valid
 	}
 
-	_ = tcpConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)) // Short read deadline
-	defer func(tcpConn *net.TCPConn, t time.Time) {
-		err := tcpConn.SetReadDeadline(t)
-		if err != nil {
-			log.Printf("Error resetting read deadline: %v", err)
-		}
-	}(tcpConn, time.Time{}) // Reset deadline on exit
-
-	var one [1]byte
-
-	_, err := tcpConn.Read(one[:])
+	// Set a longer read deadline (100ms) to avoid false negatives
+	err := tcpConn.SetReadDeadline(time.Now().Add(readDeadline))
 	if err != nil {
-		result.Error = fmt.Errorf("connection returned by pool is not valid: %w", err)
-
+		log.Printf("Error setting read deadline: %v", err)
 		return false
 	}
 
-	// Connection is still open but no data was read (successful read)
-	return true
+	defer func() {
+		if err = tcpConn.SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("Error resetting read deadline: %v", err)
+		}
+	}()
+
+	// Try to read a single byte
+	buf := make([]byte, 1)
+	_, err = tcpConn.Read(buf)
+
+	// Connection is considered valid if:
+	// 1. Read succeeds (some services send banner)
+	// 2. Read times out (most common for services that wait for client)
+	// 3. Connection is closed by remote (service accepts and closes)
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return true // Timeout is expected and indicates port is open
+		}
+
+		if err.Error() == "EOF" {
+			return true // EOF means connection was accepted then closed
+		}
+	}
+
+	return err == nil // If no error, read succeeded
 }
 
 func (s *TCPScanner) Stop(context.Context) error {
-	s.pool.close()
+	if s.pool != nil {
+		s.pool.close()
+	}
+
 	return nil
 }

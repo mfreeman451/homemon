@@ -55,12 +55,6 @@ type HealthServer struct {
 	checker *DuskChecker
 }
 
-func NewHealthServer(checker *DuskChecker) *HealthServer {
-	return &HealthServer{
-		checker: checker,
-	}
-}
-
 // DuskBlockService provides block data via gRPC.
 type DuskBlockService struct {
 	proto.UnimplementedAgentServiceServer
@@ -281,10 +275,15 @@ func (d *DuskChecker) listenForEvents() {
 	for {
 		select {
 		case <-d.Done:
+			if err := d.ws.Close(); err != nil {
+				log.Printf("Error closing websocket connection: %v", err)
+			}
+
 			return
 		default:
 			if err := d.ws.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 				log.Printf("Failed to set read deadline: %v", err)
+
 				return
 			}
 
@@ -305,6 +304,7 @@ func (d *DuskChecker) listenForEvents() {
 
 			if err := d.processMessage(data); err != nil {
 				log.Printf("Error processing message: %v", err)
+
 				// Don't return here - continue processing messages
 				continue
 			}
