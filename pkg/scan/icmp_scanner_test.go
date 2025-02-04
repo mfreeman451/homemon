@@ -3,6 +3,8 @@ package scan
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,7 +13,251 @@ import (
 	"github.com/mfreeman451/serviceradar/pkg/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
+
+func TestListenForRepliesBasicFlow(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockConn := NewMockPacketConnInterface(ctrl)
+	scanner := &ICMPScanner{
+		socketPool: &socketPool{
+			sockets: []*socketEntry{
+				{
+					conn:      mockConn,
+					createdAt: time.Now(),
+					lastUsed:  atomic.Value{},
+				},
+			},
+		},
+		done:       make(chan struct{}),
+		bufferPool: newBufferPool(maxPacketSize),
+		responses:  sync.Map{},
+	}
+	scanner.socketPool.sockets[0].lastUsed.Store(time.Now())
+
+	// Setup mock expectations
+	mockConn.EXPECT().
+		Close().
+		Return(nil).
+		AnyTimes()
+
+	mockConn.EXPECT().
+		SetReadDeadline(gomock.Any()).
+		Return(nil).
+		Times(1)
+
+	mockConn.EXPECT().
+		ReadFrom(gomock.Any()).
+		DoAndReturn(func(b []byte) (int, net.Addr, error) {
+			return 4, &net.IPAddr{IP: net.ParseIP("127.0.0.1")}, nil
+		}).
+		Times(1)
+
+	// Setup response tracking for the target
+	scanner.responses.Store("127.0.0.1", &pingResponse{})
+
+	// Test the listener function
+	readyChan := make(chan struct{})
+	errChan := make(chan error, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Log("Starting listenForReplies")
+	go func() {
+		errChan <- scanner.listenForReplies(ctx, readyChan)
+	}()
+
+	// Wait for ready signal
+	select {
+	case <-readyChan:
+		t.Log("Got ready signal")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timeout waiting for ready signal")
+	}
+
+	// Give time for ReadFrom to be called
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel context to stop listener
+	cancel()
+
+	// Check for errors
+	select {
+	case err := <-errChan:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		t.Log("Got expected context.Canceled error")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timeout waiting for listener to stop")
+	}
+}
+
+func TestListenForRepliesContextCancellation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockConn := NewMockPacketConnInterface(ctrl)
+	scanner := &ICMPScanner{
+		socketPool: &socketPool{
+			sockets: []*socketEntry{
+				{
+					conn:      mockConn,
+					createdAt: time.Now(),
+					lastUsed:  atomic.Value{},
+				},
+			},
+		},
+		done:       make(chan struct{}),
+		bufferPool: newBufferPool(maxPacketSize), // Initialize buffer pool
+	}
+	scanner.socketPool.sockets[0].lastUsed.Store(time.Now())
+
+	// Expect deadline to be set before each read
+	mockConn.EXPECT().
+		SetReadDeadline(gomock.Any()).
+		Return(nil).
+		AnyTimes()
+
+	// Expect ReadFrom to simulate blocking until canceled
+	mockConn.EXPECT().
+		ReadFrom(gomock.Any()).
+		DoAndReturn(func([]byte) (int, net.Addr, error) {
+			select {
+			case <-time.After(10 * time.Millisecond):
+				return 0, nil, &net.OpError{Op: "read", Err: context.Canceled}
+			}
+		}).
+		AnyTimes()
+
+	// Expect Close to be called during cleanup
+	mockConn.EXPECT().
+		Close().
+		Return(nil).
+		AnyTimes()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	readyChan := make(chan struct{})
+
+	// Start listener
+	errChan := make(chan error, 1)
+	go func() {
+		err := scanner.listenForReplies(ctx, readyChan)
+		errChan <- err
+	}()
+
+	// Wait for ready signal with timeout
+	select {
+	case <-readyChan:
+		// Give a moment for the read operation to start
+		time.Sleep(20 * time.Millisecond)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timeout waiting for ready signal")
+	}
+
+	// Cancel the context
+	cancel()
+
+	// Wait for error response with timeout
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timeout waiting for context cancellation")
+	}
+}
+
+func TestListenForRepliesReadError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockConn := NewMockPacketConnInterface(ctrl)
+	scanner := &ICMPScanner{
+		socketPool: &socketPool{
+			sockets: []*socketEntry{
+				{
+					conn:      mockConn,
+					createdAt: time.Now(),
+					lastUsed:  atomic.Value{},
+				},
+			},
+		},
+		done:       make(chan struct{}),
+		bufferPool: newBufferPool(maxPacketSize),
+		responses:  sync.Map{},
+	}
+	scanner.socketPool.sockets[0].lastUsed.Store(time.Now())
+
+	testDone := make(chan struct{})
+	defer close(testDone)
+
+	// Create base error
+	readErr := fmt.Errorf("test read error")
+
+	// First expect SetReadDeadline
+	mockConn.EXPECT().
+		SetReadDeadline(gomock.Any()).
+		DoAndReturn(func(testTime time.Time) error {
+			select {
+			case <-testDone:
+			default:
+				t.Logf("SetReadDeadline called at %v", time.Now())
+			}
+			return nil
+		}).
+		AnyTimes()
+
+	// Then expect ReadFrom to return error
+	mockConn.EXPECT().
+		ReadFrom(gomock.Any()).
+		DoAndReturn(func(b []byte) (int, net.Addr, error) {
+			select {
+			case <-testDone:
+			default:
+				t.Logf("ReadFrom called at %v", time.Now())
+			}
+			return 0, nil, readErr
+		}).
+		AnyTimes()
+
+	// Execute test
+	readyChan := make(chan struct{})
+	errChan := make(chan error, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Logf("Starting listenForReplies at %v", time.Now())
+	go func() {
+		err := scanner.listenForReplies(ctx, readyChan)
+		select {
+		case <-testDone:
+		default:
+			t.Logf("listenForReplies returned with error at %v: %v", time.Now(), err)
+			errChan <- err
+		}
+	}()
+
+	t.Logf("Waiting for ready signal at %v", time.Now())
+	select {
+	case <-readyChan:
+		t.Logf("Got ready signal at %v", time.Now())
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timeout waiting for ready signal")
+	}
+
+	select {
+	case err := <-errChan:
+		t.Logf("Got error at %v: %v", time.Now(), err)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), readErr.Error())
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timeout waiting for error")
+	}
+}
 
 func TestICMPChecksum(t *testing.T) {
 	tests := []struct {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -20,16 +21,19 @@ import (
 )
 
 const (
-	maxPacketSize       = 1500
-	templateSize        = 8
-	defaultMaxSocketAge = 10 * time.Minute
-	defaultMaxIdleTime  = 1 * time.Minute
-	packetReadDeadline  = 100 * time.Millisecond
-	cleanupInterval     = 30 * time.Second
-	icmpProtocol        = 1 // Protocol number for ICMP.
-	defaultMaxSockets   = 10
-	templateIDOffset    = 4
-	templateChecksum    = 2
+	maxConsecutiveErrors     = 5
+	maxBackoffDuration       = 5 * time.Second
+	maxPacketSize            = 1500
+	templateSize             = 8
+	defaultBackoffMultiplier = 2
+	defaultMaxSocketAge      = 10 * time.Minute
+	defaultMaxIdleTime       = 1 * time.Minute
+	packetReadDeadline       = 100 * time.Millisecond
+	cleanupInterval          = 30 * time.Second
+	icmpProtocol             = 1 // Protocol number for ICMP.
+	defaultMaxSockets        = 10
+	templateIDOffset         = 4
+	templateChecksum         = 2
 )
 
 var (
@@ -49,7 +53,7 @@ type pingResponse struct {
 
 // socketEntry represents a pooled socket with metadata.
 type socketEntry struct {
-	conn      *icmp.PacketConn
+	conn      PacketConnInterface
 	createdAt time.Time
 	lastUsed  atomic.Value
 	inUse     atomic.Int32
@@ -84,7 +88,7 @@ type bufferPool struct {
 	pool sync.Pool
 }
 
-func (p *socketPool) getSocket() (*icmp.PacketConn, func(), error) {
+func (p *socketPool) getSocket() (PacketConnInterface, func(), error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -191,7 +195,7 @@ func (p *socketPool) recycleSocket(now time.Time) (*socketEntry, error) {
 // that decrements the in-use counter and updates the last used timestamp.
 //
 //nolint:unparam // error is reserved for future use; currently always nil.
-func (*socketPool) socketWithReleaseFunc(entry *socketEntry) (*icmp.PacketConn, func(), error) {
+func (*socketPool) socketWithReleaseFunc(entry *socketEntry) (PacketConnInterface, func(), error) {
 	// Create a copy of entry for use in the closure to avoid race conditions.
 	e := entry
 	release := func() {
@@ -689,6 +693,7 @@ func (s *ICMPScanner) listenForReplies(ctx context.Context, ready chan<- struct{
 	conn, release, err := s.socketPool.getSocket()
 	if err != nil {
 		close(ready)
+
 		return fmt.Errorf("failed to get socket: %w", err)
 	}
 	defer release()
@@ -699,6 +704,9 @@ func (s *ICMPScanner) listenForReplies(ctx context.Context, ready chan<- struct{
 	// Create buffer for reading.
 	buffer := s.bufferPool.get()
 	defer s.bufferPool.put(buffer)
+
+	consecutiveErrors := 0
+	backoffDuration := time.Millisecond * 500 // Initial backoff duration.
 
 	for {
 		select {
@@ -716,8 +724,22 @@ func (s *ICMPScanner) listenForReplies(ctx context.Context, ready chan<- struct{
 
 			if msg == nil {
 				// Non-fatal error or no valid message received; continue.
+				consecutiveErrors++
+				if consecutiveErrors >= maxConsecutiveErrors {
+					// After several consecutive errors, apply backoff
+					log.Printf("Too many consecutive errors. Applying backoff for %s", backoffDuration)
+					time.Sleep(backoffDuration)
+
+					// Exponentially increase the backoff duration up to a maximum threshold.
+					backoffDuration = time.Duration(math.Min(float64(backoffDuration*defaultBackoffMultiplier),
+						float64(maxBackoffDuration)))
+				}
+
 				continue
 			}
+
+			// Reset consecutive errors if message was successfully read.
+			consecutiveErrors = 0
 
 			if msg.Type != ipv4.ICMPTypeEchoReply {
 				// Not an echo reply; ignore.
@@ -733,7 +755,7 @@ func (s *ICMPScanner) listenForReplies(ctx context.Context, ready chan<- struct{
 // It returns (msg, peer, nil) on success, or (nil, nil, err) for fatal errors.
 // For nonfatal errors (e.g. i/o timeout or parse errors) it returns (nil, nil, nil)
 // so that the caller can simply continue the loop.
-func (s *ICMPScanner) readOneMessage(conn *icmp.PacketConn, buffer []byte) (*icmp.Message, net.Addr, error) {
+func (s *ICMPScanner) readOneMessage(conn PacketConnInterface, buffer []byte) (*icmp.Message, net.Addr, error) {
 	// Set read deadline.
 	if err := conn.SetReadDeadline(time.Now().Add(packetReadDeadline)); err != nil {
 		if !strings.Contains(err.Error(), "use of closed network connection") {

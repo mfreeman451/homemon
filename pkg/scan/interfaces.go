@@ -2,11 +2,20 @@ package scan
 
 import (
 	"context"
+	"net"
+	"time"
 
 	"github.com/mfreeman451/serviceradar/pkg/models"
 )
 
-//go:generate mockgen -destination=mock_scanner.go -package=scan github.com/mfreeman451/serviceradar/pkg/scan Scanner,ResultProcessor
+//go:generate mockgen -destination=mock_scanner.go -package=scan github.com/mfreeman451/serviceradar/pkg/scan Scanner,ResultProcessor,PacketConnInterface
+
+type PacketConnInterface interface {
+	SetReadDeadline(t time.Time) error
+	ReadFrom(b []byte) (n int, addr net.Addr, err error)
+	WriteTo(p []byte, addr net.Addr) (n int, err error)
+	Close() error
+}
 
 // Scanner defines how to perform network sweeps.
 type Scanner interface {
