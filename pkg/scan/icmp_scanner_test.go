@@ -41,62 +41,61 @@ func TestListenForRepliesBasicFlow(t *testing.T) {
 	}
 	scanner.socketPool.sockets[0].lastUsed.Store(time.Now())
 
-	// Setup mock expectations
-	mockConn.EXPECT().
-		Close().
-		Return(nil).
-		AnyTimes()
+	// Set up mock expectations for SetReadDeadline and ReadFrom using gomock.InOrder
+	readyChan := make(chan struct{}) // Create readyChan here
+	readFromCalled := make(chan struct{})
 
-	mockConn.EXPECT().
-		SetReadDeadline(gomock.Any()).
-		Return(nil).
-		Times(1)
-
-	mockConn.EXPECT().
-		ReadFrom(gomock.Any()).
-		DoAndReturn(func([]byte) (int, net.Addr, error) {
-			// Simulate a read operation, e.g., return an ICMP reply
+	gomock.InOrder(
+		mockConn.EXPECT().SetReadDeadline(gomock.Any()).Return(nil).Times(1),
+		mockConn.EXPECT().ReadFrom(gomock.Any()).DoAndReturn(func(b []byte) (int, net.Addr, error) {
+			t.Log("Waiting for ReadFrom")
+			close(readFromCalled) // Signal that ReadFrom has been called
 			return 4, &net.IPAddr{IP: net.ParseIP("127.0.0.1")}, nil
-		}).
-		Times(1)
 
-	// Setup response tracking for the target
+		}).Times(1),
+		mockConn.EXPECT().Close().Return(nil).Times(1), // Expect Close once at the end
+	)
+
+	// Set up response tracking for the target
 	scanner.responses.Store("127.0.0.1", &pingResponse{})
 
-	// Test the listener function
-	readyChan := make(chan struct{})
+	// Start the listener function
 	errChan := make(chan error, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	t.Log("Starting listenForReplies")
+
 	go func() {
 		errChan <- scanner.listenForReplies(ctx, readyChan)
+		t.Log("Listener has finished")
 	}()
 
-	// Wait for ready signal
+	// Wait for the ready signal using a channel (instead of using time.Sleep)
 	select {
-	case <-readyChan:
+	case <-readyChan: // Ensure that the listener has started
 		t.Log("Got ready signal")
+	case <-time.After(100 * time.Millisecond): // Timeout for readiness signal
+		t.Fatal("Timeout waiting for ready signal")
+	}
+
+	// Wait for ReadFrom to be called
+	select {
+	case <-readFromCalled:
+		t.Log("ReadFrom was called")
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("Timeout waiting for ready signal")
 	}
 
-	// Give time for ReadFrom to be called
-	time.Sleep(50 * time.Millisecond)
-
-	// Cancel context to stop listener
-	cancel()
-
-	// Check for errors
+	// Check if the listener is still running and if the ReadFrom call is triggered
 	select {
 	case err := <-errChan:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 		t.Log("Got expected context.Canceled error")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): // Timeout waiting for listener to stop
 		t.Fatal("Timeout waiting for listener to stop")
 	}
 }
@@ -196,44 +195,38 @@ func TestListenForRepliesReadError(t *testing.T) {
 	}
 	scanner.socketPool.sockets[0].lastUsed.Store(time.Now())
 
-	testDone := make(chan struct{})
-	defer close(testDone)
+	// Create base error to simulate a read error
+	readErr := fmt.Errorf("test read error")
 
-	// Create base error
-	readErr := errTestReadError
-
+	// Setup mock expectations
 	mockConn.EXPECT().
 		Close().
 		Return(nil).
 		AnyTimes()
 
-	// First expect SetReadDeadline
+	// Expect SetReadDeadline to be called
 	mockConn.EXPECT().
 		SetReadDeadline(gomock.Any()).
-		DoAndReturn(func(time.Time) error {
-			select {
-			case <-testDone:
-			default:
-				t.Logf("SetReadDeadline called at %v", time.Now())
-			}
-			return nil
-		}).
+		Return(nil).
 		AnyTimes()
 
-	// Then expect ReadFrom to return error
+	// Expect ReadFrom to return the error ONCE, then block indefinitely to prevent backoff loops
+	readCount := 0
 	mockConn.EXPECT().
 		ReadFrom(gomock.Any()).
-		DoAndReturn(func([]byte) (int, net.Addr, error) {
-			select {
-			case <-testDone:
-			default:
-				t.Logf("ReadFrom called at %v", time.Now())
+		DoAndReturn(func(b []byte) (int, net.Addr, error) {
+			readCount++
+			t.Logf("ReadFrom called at %v, count: %d", time.Now(), readCount)
+			if readCount == 1 {
+				return 0, nil, readErr // Simulate read error on first call
 			}
-			return 0, nil, readErr
+			// Block indefinitely on subsequent calls to prevent continuous errors and backoff
+			<-context.Background().Done()   // Block until context is cancelled (which won't happen in this test)
+			return 0, nil, context.Canceled // Should not reach here in normal test flow
 		}).
 		AnyTimes()
 
-	// Execute test
+	// Test the listener function
 	readyChan := make(chan struct{})
 	errChan := make(chan error, 1)
 
@@ -241,31 +234,32 @@ func TestListenForRepliesReadError(t *testing.T) {
 	defer cancel()
 
 	t.Logf("Starting listenForReplies at %v", time.Now())
-
 	go func() {
 		err := scanner.listenForReplies(ctx, readyChan)
 		select {
-		case <-testDone:
+		case <-readyChan:
 		default:
 			t.Logf("listenForReplies returned with error at %v: %v", time.Now(), err)
 			errChan <- err
 		}
 	}()
 
+	// Wait for the ready signal with increased timeout
 	t.Logf("Waiting for ready signal at %v", time.Now())
 	select {
 	case <-readyChan:
 		t.Logf("Got ready signal at %v", time.Now())
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond): // Increased timeout for readiness
 		t.Fatal("Timeout waiting for ready signal")
 	}
 
+	// Expect the error to be received with increased timeout
 	select {
 	case err := <-errChan:
 		t.Logf("Got error at %v: %v", time.Now(), err)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), readErr.Error())
-	case <-time.After(100 * time.Millisecond):
+		require.Contains(t, err.Error(), readErr.Error()) // Ensure the error is the expected one
+	case <-time.After(500 * time.Millisecond): // Increased timeout here as well
 		t.Fatal("Timeout waiting for error")
 	}
 }

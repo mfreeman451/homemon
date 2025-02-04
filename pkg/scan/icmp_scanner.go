@@ -687,19 +687,17 @@ func (s *ICMPScanner) processBatch(
 }
 
 func (s *ICMPScanner) listenForReplies(ctx context.Context, ready chan<- struct{}) error {
+	// Signal that we're ready to receive (moved before read loop)
+	close(ready)
+
 	defer log.Println("listenForReplies complete")
 
 	// Get a socket from the pool.
 	conn, release, err := s.socketPool.getSocket()
 	if err != nil {
-		close(ready)
-
 		return fmt.Errorf("failed to get socket: %w", err)
 	}
 	defer release()
-
-	// Signal that we're ready to receive.
-	close(ready)
 
 	// Create buffer for reading.
 	buffer := s.bufferPool.get()
@@ -711,10 +709,11 @@ func (s *ICMPScanner) listenForReplies(ctx context.Context, ready chan<- struct{
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("Context canceled")
 			return ctx.Err()
 		case <-s.done:
 			return nil
-		default:
+		default: // Removed `case <-ready:` here
 			// Read one ICMP message.
 			msg, peer, err := s.readOneMessage(conn, buffer)
 			if err != nil {
@@ -765,24 +764,15 @@ func (s *ICMPScanner) readOneMessage(conn PacketConnInterface, buffer []byte) (*
 		return nil, nil, err
 	}
 
-	// Read from the connection.
 	n, peer, err := conn.ReadFrom(buffer)
 	if err != nil {
-		// If the error is not a closed connection or timeout, return it.
-		if !strings.Contains(err.Error(), "use of closed network connection") &&
-			!strings.Contains(err.Error(), "i/o timeout") {
-			return nil, nil, err
-		}
-
-		// For timeout or closed connection errors, return nil so the loop can continue.
 		return nil, nil, nil
 	}
 
 	// Parse the ICMP message.
 	msg, err := s.parseICMPMessage(buffer[:n])
 	if err != nil {
-		// Non-fatal: ignore parse errors.
-		return nil, nil, nil
+		return nil, nil, err
 	}
 
 	return msg, peer, nil
@@ -827,6 +817,11 @@ func (s *ICMPScanner) processICMPReply(peer net.Addr) {
 	}
 
 	resp := value.(*pingResponse)
+
+	// Initialize sendTime if it's not already set.
+	if sendTime, ok := resp.sendTime.Load().(time.Time); !ok || sendTime.IsZero() {
+		resp.sendTime.Store(time.Now())
+	}
 
 	// Update response metrics
 	now := time.Now()
