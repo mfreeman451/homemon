@@ -16,6 +16,10 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
+var (
+	errTestReadError = fmt.Errorf("test read error")
+)
+
 func TestListenForRepliesBasicFlow(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -50,7 +54,8 @@ func TestListenForRepliesBasicFlow(t *testing.T) {
 
 	mockConn.EXPECT().
 		ReadFrom(gomock.Any()).
-		DoAndReturn(func(b []byte) (int, net.Addr, error) {
+		DoAndReturn(func([]byte) (int, net.Addr, error) {
+			// Simulate a read operation, e.g., return an ICMP reply
 			return 4, &net.IPAddr{IP: net.ParseIP("127.0.0.1")}, nil
 		}).
 		Times(1)
@@ -195,12 +200,17 @@ func TestListenForRepliesReadError(t *testing.T) {
 	defer close(testDone)
 
 	// Create base error
-	readErr := fmt.Errorf("test read error")
+	readErr := errTestReadError
+
+	mockConn.EXPECT().
+		Close().
+		Return(nil).
+		AnyTimes()
 
 	// First expect SetReadDeadline
 	mockConn.EXPECT().
 		SetReadDeadline(gomock.Any()).
-		DoAndReturn(func(testTime time.Time) error {
+		DoAndReturn(func(time.Time) error {
 			select {
 			case <-testDone:
 			default:
@@ -213,7 +223,7 @@ func TestListenForRepliesReadError(t *testing.T) {
 	// Then expect ReadFrom to return error
 	mockConn.EXPECT().
 		ReadFrom(gomock.Any()).
-		DoAndReturn(func(b []byte) (int, net.Addr, error) {
+		DoAndReturn(func([]byte) (int, net.Addr, error) {
 			select {
 			case <-testDone:
 			default:
@@ -231,6 +241,7 @@ func TestListenForRepliesReadError(t *testing.T) {
 	defer cancel()
 
 	t.Logf("Starting listenForReplies at %v", time.Now())
+
 	go func() {
 		err := scanner.listenForReplies(ctx, readyChan)
 		select {
